@@ -40,7 +40,12 @@ export default {
   deb,
   rpm,
 
-  npmRebuild: true,
+  // All native deps (sharp, @lydell/node-pty, opencv-js) ship N-API
+  // prebuilt binaries that work across Node/Electron ABIs, so no rebuild
+  // is needed. Keeping this true makes @electron/rebuild walk the whole
+  // node_modules tree, which fails on pnpm workspace junctions when the
+  // local antivirus blocks junction traversal (UNKNOWN error).
+  npmRebuild: false,
 
   publish: {
     provider: 'github',

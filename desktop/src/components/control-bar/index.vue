@@ -94,6 +94,7 @@
 import { controlBarHeight } from '$control/configs/index.js'
 import Install from './install/index.vue'
 import Launch from './launch/index.vue'
+import Log from './log/index.vue'
 import Explorer from './explorer/index.vue'
 import Gnirehtet from './gnirehtet/index.vue'
 import Rotation from './rotation/index.vue'
@@ -109,6 +110,7 @@ export default {
     Gnirehtet,
     Rotation,
     Volume,
+    Log,
     Explorer,
     Terminal,
   },
@@ -161,6 +163,11 @@ export default {
           label: 'device.control.return',
           fontIcon: 'i-cil-caret-left',
           command: 'input keyevent 4',
+        },
+        settings: {
+          label: 'device.control.settings',
+          fontIcon: 'i-famicons-settings-outline',
+          command: 'am start -a android.settings.SETTINGS',
         },
         launch: {
           label: 'device.control.launch',
@@ -217,6 +224,11 @@ export default {
           fontIcon: 'i-bi-folder',
           component: 'Explorer',
         },
+        log: {
+          label: 'device.control.log.name',
+          fontIcon: 'i-bi-file-text',
+          component: 'Log',
+        },
         terminal: {
           label: 'device.terminal.name',
           fontIcon: 'i-bi-terminal',
@@ -233,7 +245,33 @@ export default {
       const isHidden = item =>
         (item.hiddenKeys || []).some(key => this.$props[key])
 
-      const barLayout = [...new Set([...this.controlStore.barLayout, ...Object.keys(valueMap)])]
+      // newly added buttons are inserted right after their previous
+      // neighbor (in the default order) that exists in the saved layout,
+      // instead of being appended at the end
+      const savedLayout = this.controlStore.barLayout
+      const allKeys = Object.keys(valueMap)
+      const mergedLayout = [...savedLayout]
+
+      for (const key of allKeys) {
+        if (mergedLayout.includes(key)) {
+          continue
+        }
+
+        const keyIndex = allKeys.indexOf(key)
+        let insertAt = mergedLayout.length
+
+        for (let i = keyIndex - 1; i >= 0; i--) {
+          const neighborIndex = mergedLayout.indexOf(allKeys[i])
+          if (neighborIndex !== -1) {
+            insertAt = neighborIndex + 1
+            break
+          }
+        }
+
+        mergedLayout.splice(insertAt, 0, key)
+      }
+
+      const barLayout = [...new Set([...mergedLayout, ...Object.keys(valueMap)])]
 
       const value = barLayout.reduce((arr, key) => {
         const item = valueMap[key]

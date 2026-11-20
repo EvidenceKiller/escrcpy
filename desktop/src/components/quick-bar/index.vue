@@ -40,6 +40,7 @@
 
 <script setup>
 import Arrange from './components/arrange/index.vue'
+import AdbRestart from './components/adb-restart/index.vue'
 import Log from './components/log/index.vue'
 import Restart from './components/restart/index.vue'
 import Search from './components/search/index.vue'
@@ -58,6 +59,11 @@ const actionModel = computed(() => {
       label: 'device.arrange.name',
       fontIcon: 'i-bi-window-split',
       component: Arrange,
+    },
+    {
+      label: 'device.adb.restart.name',
+      fontIcon: 'i-bi-arrow-repeat',
+      component: AdbRestart,
     },
     {
       label: 'device.terminal.name',

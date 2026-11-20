@@ -31,7 +31,8 @@ export function getAdbx() {
 }
 
 electronAPI.ipcRenderer.on('quit-before', () => {
-  client?.kill?.()
+  // keep the adb server alive after the app exits, only clean up
+  // transient adb client processes spawned by this app
   processManager.kill()
 })
 
@@ -117,6 +118,45 @@ async function screencap(deviceId, options = {}) {
   return true
 }
 
+// one background logcat capture per device
+const logcatProcesses = new Map()
+
+/**
+ * Captures `adb logcat` output of the device into a local file.
+ * logcat never exits on its own, so the process runs in the background
+ * (fire and forget) and is tracked by the process manager; a new capture
+ * for the same device stops the previous one.
+ */
+function logcat(deviceId, { savePath } = {}) {
+  if (!savePath) {
+    throw new Error('adb.logcat requires a savePath')
+  }
+
+  const previous = logcatProcesses.get(deviceId)
+  if (previous) {
+    previous.kill?.()
+    logcatProcesses.delete(deviceId)
+  }
+
+  const stream = fs.createWriteStream(savePath, { flags: 'w' })
+  const adbProcess = sheller(`adb -s ${deviceId} logcat`, {
+    shell: true,
+  })
+
+  processManager.add(adbProcess)
+  adbProcess.stdout?.pipe?.(stream)
+
+  adbProcess.catch((error) => {
+    console.warn('adb.logcat.error', error?.message)
+    logcatProcesses.delete(deviceId)
+    stream.end()
+  })
+
+  logcatProcesses.set(deviceId, adbProcess)
+
+  return { savePath, running: true }
+}
+
 async function install(id, path) {
   return getAdbx().install(id, path)
 }
@@ -133,22 +173,33 @@ async function version() {
   return client.version()
 }
 
+// the device tracker is owned by the middleware so it can be re-established
+// after the adb server restarts
+let tracker = null
+let watchCallback = null
+
 async function watch(callback) {
-  const tracker = await client.trackDevices()
-  tracker.on('add', async (ret) => {
-    callback('add', ret)
+  watchCallback = callback
+  return setupTracker()
+}
+
+async function setupTracker() {
+  tracker = await client.trackDevices()
+
+  tracker.on('add', (ret) => {
+    watchCallback?.('add', ret)
   })
 
   tracker.on('remove', (device) => {
-    callback('remove', device)
+    watchCallback?.('remove', device)
   })
 
   tracker.on('end', (ret) => {
-    callback('end', ret)
+    watchCallback?.('end', ret)
   })
 
   tracker.on('error', (err) => {
-    callback('error', err)
+    watchCallback?.('error', err)
   })
 
   const close = () => tracker.end()
@@ -358,6 +409,119 @@ async function pair(host, port, code) {
   return stdout
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * Runs `adb shell <password>` as a fire-and-forget command (no receipt
+ * handling), then waits one second for the device to process the password.
+ */
+async function loginShell(address, password) {
+  // fire and forget, no return value expected
+  shell(`-s ${address} shell "${password}"`).catch((error) => {
+    console.warn('adb.loginShell.error', error?.message)
+  })
+
+  await sleep(1000)
+}
+
+/**
+ * Opens an interactive `adb shell` and checks whether the session can be
+ * entered: it staying open means the login is OK; closing early (typically
+ * with error/closed output) means the login has not taken effect yet.
+ */
+async function probeShell(address, timeout = 2000) {
+  const adbProcess = sheller(`adb -s ${address} shell`, {
+    shell: true,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+
+  processManager.add(adbProcess)
+
+  let output = ''
+
+  const onChunk = (chunk) => {
+    output += String(chunk)
+  }
+
+  adbProcess.stdout?.on('data', onChunk)
+  adbProcess.stderr?.on('data', onChunk)
+
+  // tolerate non-zero exit codes (e.g. 255), judge by session state instead
+  const promise = adbProcess.catch(error => ({ stderr: error?.stderr || error?.message }))
+
+  let closed = false
+
+  adbProcess.once('close', () => {
+    closed = true
+  })
+
+  const start = Date.now()
+
+  while (Date.now() - start < timeout) {
+    if (closed) {
+      break
+    }
+    await sleep(100)
+  }
+
+  try {
+    await adbProcess.kill?.()
+  }
+  catch (error) {
+    console.warn('adb.probeShell.kill.error', error.message)
+  }
+
+  await promise
+
+  return { entered: !closed, output: output.trim() }
+}
+
+/**
+ * The password command may take a moment to take effect on the device, so the
+ * probe is retried with a gap between attempts before the login is marked as
+ * failed.
+ */
+async function verifyShellLogin(address, maxAttempts = 3, probeTimeout = 2000) {
+  let lastOutput = ''
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const { entered, output } = await probeShell(address, probeTimeout)
+
+    if (entered) {
+      return { stdout: output }
+    }
+
+    lastOutput = output
+
+    if (attempt < maxAttempts) {
+      await sleep(1000)
+    }
+  }
+
+  const reason = /error|closed/i.test(lastOutput) && lastOutput
+    ? lastOutput.split('\n').at(-1)?.trim() || 'shell session closed'
+    : 'shell session closed'
+
+  throw new Error(`Shell login failed: ${reason}`)
+}
+
+/**
+ * Shell password login, independent from `connect`:
+ * 1. run `adb shell <password>` (fire and forget);
+ * 2. one second later, probe with an interactive `adb shell`: if the session
+ *    can be entered, the login is OK; error/closed output marks it as failed.
+ */
+async function shellLogin(host, port, password) {
+  const address = port ? `${host}:${port}` : host
+
+  await loginShell(address, password)
+
+  return verifyShellLogin(address)
+}
+
 async function connect(host, port) {
   const address = port ? `${host}:${port}` : host
 
@@ -502,6 +666,29 @@ async function killProcesses() {
   return processManager.kill()
 }
 
+/**
+ * Restarts the adb server: kill-server first, then start-server.
+ * Re-creates the adbkit client and re-establishes the device watcher,
+ * since the old tracker connection dies with the server.
+ */
+async function restart() {
+  await shell('kill-server')
+  await shell('start-server')
+
+  init()
+
+  if (watchCallback) {
+    try {
+      tracker?.end?.()
+    }
+    catch (error) {
+      console.warn('adb.restart.tracker.end.error', error.message)
+    }
+
+    await setupTracker()
+  }
+}
+
 export default {
   shell,
   init,
@@ -509,12 +696,15 @@ export default {
   getDeviceList,
   deviceShell,
   kill,
+  restart,
   pair,
   connect,
+  shellLogin,
   disconnect,
   getDeviceIP,
   tcpip,
   screencap,
+  logcat,
   install,
   uninstall,
   isInstalled,

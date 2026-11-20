@@ -103,6 +103,14 @@
               }"
             />
 
+            <LoginAction
+              v-if="row.wifi"
+              v-bind="{
+                device: row,
+                handleLogin,
+              }"
+            />
+
             <MirrorAction
               v-if="['device', 'unauthorized'].includes(row.status)"
               :ref="getMirrorActionRefs"
@@ -168,6 +176,7 @@ import MoreDropdown from './components/more-dropdown/index.vue'
 import Remark from './components/remark/index.vue'
 import WirelessAction from './components/wireless-action/index.vue'
 import ConnectAction from './components/connect-action/index.vue'
+import LoginAction from './components/login-action/index.vue'
 import RemoveAction from './components/remove-action/index.vue'
 import WirelessGroup from './components/wireless-group/index.vue'
 import DevicePopover from './components/device-popover/index.vue'
@@ -312,6 +321,10 @@ function toggleRowExpansion(...args) {
 
 function handleConnect(...args) {
   wirelessGroupRef.value.connect(...args)
+}
+
+function handleLogin(...args) {
+  wirelessGroupRef.value.shellLogin(...args)
 }
 
 async function handleRefresh() {

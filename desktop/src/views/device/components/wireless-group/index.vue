@@ -1,16 +1,18 @@
 <template>
   <div class="flex items-center flex-none !space-x-2">
-    <div class="w-72 flex-none">
+    <div class="w-56 flex-none">
       <el-autocomplete
         :key="autocompleteKey"
         ref="elAutocompleteRef"
-        v-model="address"
-        placeholder="192.168.0.1:5555"
+        v-model="host"
+        :placeholder="$t('device.wireless.connect.host')"
         clearable
         :fetch-suggestions="fetchSuggestions"
         class="!w-full el-autocomplete--wireless"
         value-key="host"
         @select="onSelect"
+        @focus="onAutocompleteFocus"
+        @input="isTyping = true"
         @keydown.enter.prevent="keydownConnect()"
         @keydown.escape="handleUnConnect()"
       >
@@ -45,6 +47,16 @@
       </el-autocomplete>
     </div>
 
+    <div class="w-24 flex-none">
+      <el-input
+        v-model="port"
+        :placeholder="$t('device.wireless.connect.port')"
+        :title="$t('device.wireless.connect.port')"
+        @keydown.enter.prevent="keydownConnect()"
+        @keydown.escape="handleUnConnect()"
+      ></el-input>
+    </div>
+
     <div class="flex-none overflow-hidden transition-all duration-300" :class="pairVisible ? 'w-26' : 'w-0 !mx-0'">
       <el-input
         v-model="pairCode"
@@ -77,6 +89,29 @@
       </el-button>
     </el-button-group>
 
+    <div class="w-32 flex-none">
+      <el-input
+        v-model="password"
+        type="password"
+        show-password
+        :placeholder="$t('device.wireless.login.name')"
+        :title="$t('device.wireless.login.name')"
+        @keydown.enter.prevent="handleShellLogin()"
+        @keydown.escape="handleUnConnect()"
+      ></el-input>
+    </div>
+
+    <el-button
+      type="default"
+      :icon="loginLoading ? '' : 'Key'"
+      :loading="loginLoading"
+      class="flex-none"
+      :title="$t('device.wireless.login.name')"
+      @click="handleShellLogin()"
+    >
+      {{ $t('device.wireless.login.name') }}
+    </el-button>
+
     <QrAction v-bind="{ handleRefresh }" />
 
     <DiscoverAction v-bind="{ handleRefresh }" />
@@ -105,12 +140,22 @@ const preferenceStore = usePreferenceStore()
 const deviceStore = useDeviceStore()
 
 const loading = ref(false)
-const address = ref('')
+const loginLoading = ref(false)
+const host = ref('')
+const port = ref('5555')
+const password = useStorage('device-wireless-password', '')
+// password used for the last successful connection of each device, keyed by `ip:port`
+const passwordMap = useStorage('device-wireless-password-map', {})
 const autocompleteKey = ref(0)
 const pairCode = ref('')
 const pairVisible = useStorage('device-wireless-pair-visible', false)
 
 const elAutocompleteRef = ref()
+const isTyping = ref(false)
+
+function onAutocompleteFocus() {
+  isTyping.value = false
+}
 
 const wirelessList = computed(() =>
   deviceStore.list.filter(item => item.wifi),
@@ -155,14 +200,19 @@ async function handleConnectAuto() {
 
 function getAddress() {
   const last = wirelessList.value.at(-1)
-  if (last)
-    address.value = last.id
+  if (!last)
+    return
+
+  const { host: lastHost, port: lastPort } = parseDeviceId(last.id)
+  host.value = lastHost
+  port.value = String(lastPort)
 }
 
 function fetchSuggestions(value, callback) {
   let results = []
 
-  if (value) {
+  // only filter while the user is typing; clicking/focusing the input shows the full history
+  if (value && isTyping.value) {
     results = wirelessList.value.filter(item =>
       item.id.toLowerCase().startsWith(value.toLowerCase()),
     )
@@ -179,7 +229,9 @@ function fetchSuggestions(value, callback) {
 }
 
 function onSelect(device) {
-  address.value = device.id
+  const { host: itemHost, port: itemPort } = parseDeviceId(device.id)
+  host.value = itemHost
+  port.value = String(itemPort)
 }
 
 function handleRemove(info) {
@@ -230,10 +282,34 @@ async function handleBatch() {
 
 function handleUnConnect() {
   loading.value = false
+  loginLoading.value = false
 }
 
-async function handleConnect(addr = address.value) {
-  if (!addr) {
+async function handleConnect(addr = '') {
+  let targetHost = addr || host.value.trim()
+  let targetPort
+
+  if (addr) {
+    const parsed = parseDeviceId(addr)
+    targetHost = parsed.host
+    targetPort = parsed.port
+
+    // sync the bottom inputs with the device being connected from the list
+    host.value = targetHost
+    port.value = String(targetPort)
+    password.value = passwordMap.value[`${targetHost}:${targetPort}`] || ''
+  }
+  else {
+    targetPort = Number.parseInt(port.value, 10)
+
+    if (!(targetPort > 0 && targetPort <= 65535)) {
+      targetPort = 5555
+    }
+  }
+
+  const targetAddress = `${targetHost}:${targetPort}`
+
+  if (!targetHost) {
     ElMessage.warning(
       window.t('device.wireless.connect.error.no-address'),
     )
@@ -242,8 +318,7 @@ async function handleConnect(addr = address.value) {
 
   if (pairCode.value) {
     try {
-      const { host, port } = parseDeviceId(address.value)
-      await window.$preload.adb.pair(host, port, pairCode.value)
+      await window.$preload.adb.pair(targetHost, targetPort, pairCode.value)
       onPairToggle(false)
 
       await sleep()
@@ -263,7 +338,11 @@ async function handleConnect(addr = address.value) {
   loading.value = true
 
   try {
-    await window.$preload.adb.connect(addr)
+    await window.$preload.adb.connect(
+      targetHost,
+      targetPort,
+    )
+
     await sleep()
     ElMessage.success(window.t('device.wireless.connect.success'))
   }
@@ -278,8 +357,76 @@ async function handleConnect(addr = address.value) {
   loading.value = false
 }
 
+/**
+ * Runs `adb shell <password>` (fire and forget), then verifies the login by
+ * opening an interactive `adb shell`: if the session can be entered, the
+ * login is OK; error/closed output marks the login as failed.
+ * When called with a device id from the device list, the remembered password
+ * of that device is used and the bottom inputs are synced.
+ */
+async function handleShellLogin(addr = '') {
+  let targetHost = addr || host.value.trim()
+  let targetPort
+
+  if (addr) {
+    const parsed = parseDeviceId(addr)
+    targetHost = parsed.host
+    targetPort = parsed.port
+
+    // sync the bottom inputs with the device being logged in from the list
+    host.value = targetHost
+    port.value = String(targetPort)
+    password.value = passwordMap.value[`${targetHost}:${targetPort}`] || ''
+  }
+  else {
+    targetPort = Number.parseInt(port.value, 10)
+
+    if (!(targetPort > 0 && targetPort <= 65535)) {
+      targetPort = 5555
+    }
+  }
+
+  if (!targetHost) {
+    ElMessage.warning(
+      window.t('device.wireless.connect.error.no-address'),
+    )
+    return
+  }
+
+  if (!password.value) {
+    ElMessage.warning(
+      window.t('device.wireless.login.error.no-password'),
+    )
+    return
+  }
+
+  loginLoading.value = true
+
+  try {
+    await window.$preload.adb.shellLogin(targetHost, targetPort, password.value)
+
+    // remember the password used for this device
+    passwordMap.value = {
+      ...passwordMap.value,
+      [`${targetHost}:${targetPort}`]: password.value,
+    }
+
+    await sleep()
+    ElMessage.success(window.t('device.wireless.login.success'))
+  }
+  catch (error) {
+    ElMessage.warning(error?.message || error?.cause?.message || error)
+  }
+  finally {
+    loginLoading.value = false
+  }
+
+  handleRefresh()
+}
+
 defineExpose({
   connect: handleConnect,
+  shellLogin: handleShellLogin,
 })
 </script>
 
